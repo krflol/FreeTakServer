@@ -4,6 +4,8 @@ use tokio::sync::broadcast;
 use tracing::{info, error, warn};
 use quick_xml::events::Event;
 use quick_xml::reader::Reader;
+use quick_xml::Writer;
+use quick_xml::events::BytesStart;
 use std::io::Cursor;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -16,7 +18,7 @@ use axum::{
     Router,
     response::{Json, IntoResponse},
 };
-use axum::extract::{Query, Path, FromRequest};
+use axum::extract::{Query, Path, FromRequest, DefaultBodyLimit};
 use axum::http::{HeaderMap, StatusCode, Request};
 use axum::body::{Body, to_bytes};
 use axum::http::header::CONTENT_TYPE;
@@ -27,6 +29,7 @@ use std::fs::File;
 use std::io::BufReader;
 use rustls_pemfile::{certs, rsa_private_keys, pkcs8_private_keys};
 use uuid::Uuid;
+use std::time::Duration;
 
 // Helper to load certs
 fn load_certs(path: &str) -> std::io::Result<Vec<CertificateDer<'static>>> {
@@ -139,8 +142,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx, _rx) = broadcast::channel::<BroadcastMsg>(100);
     let connection_ids = Arc::new(AtomicU64::new(1));
     let presence_cache: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+    let repeat_cache: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
     let conn_state: Arc<RwLock<HashMap<u64, ConnState>>> = Arc::new(RwLock::new(HashMap::new()));
     let uid_to_conn: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
+
+    // Periodic rebroadcast of cached presence to keep clients updated without ping/pong.
+    let presence_repeat = presence_cache.clone();
+    let repeat_repeat = repeat_cache.clone();
+    let tx_repeat = tx.clone();
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            // Re-broadcast presence with refreshed timestamps.
+            {
+                let cache = presence_repeat.read().await;
+                for (_uid, bytes) in cache.iter() {
+                    if let Some(updated) = rewrite_event_times(bytes, chrono::Duration::minutes(5)) {
+                        let _ = tx_repeat.send(BroadcastMsg { from: 0, bytes: updated });
+                    } else {
+                        let _ = tx_repeat.send(BroadcastMsg { from: 0, bytes: bytes.clone() });
+                    }
+                }
+            }
+            // Re-broadcast repeatable items less frequently (keepalive for points/shapes).
+            {
+                let cache = repeat_repeat.read().await;
+                for (_uid, bytes) in cache.iter() {
+                    if let Some(updated) = rewrite_event_times(bytes, chrono::Duration::hours(24)) {
+                        let _ = tx_repeat.send(BroadcastMsg { from: 0, bytes: updated });
+                    } else {
+                        let _ = tx_repeat.send(BroadcastMsg { from: 0, bytes: bytes.clone() });
+                    }
+                }
+            }
+        }
+    });
 
     // --- TLS setup for CoT ---
     let certs = load_certs("certs/server.pem")?;
@@ -154,9 +191,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- HTTP SERVER (Axum) ---
     let pool_http = pool.clone();
     let tx_api = tx.clone();
+    let uid_map_http = uid_to_conn.clone();
 
     tokio::spawn(async move {
-        let app_state = Arc::new(AppState { pool: pool_http, tx: tx_api });
+        let app_state = Arc::new(AppState { pool: pool_http, tx: tx_api, uid_to_conn: uid_map_http });
 
         let app = Router::new()
             .route("/Manage/HealthCheck", get(health_check))
@@ -207,6 +245,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .route("/Marti/api/missions/:mission_id/contents/missionpackage", axum::routing::put(not_implemented))
             .route("/Marti/api/missions/:mission_id/invite/:type/:invitee", axum::routing::put(not_implemented))
             .route("/Marti/api/missions/:mission_id/invite", axum::routing::post(not_implemented))
+            // Allow large uploads (ATAK attachments can exceed default limits)
+            .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
             .with_state(app_state);
 
         let http_addr = "0.0.0.0:8080";
@@ -239,6 +279,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool_tls = pool.clone();
     let presence_tcp = presence_cache.clone();
     let presence_tls = presence_cache.clone();
+    let repeat_tcp = repeat_cache.clone();
+    let repeat_tls = repeat_cache.clone();
     let state_tcp = conn_state.clone();
     let state_tls = conn_state.clone();
     let uid_map_tcp = uid_to_conn.clone();
@@ -253,12 +295,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                  let tx = tx_tcp.clone();
                  let rx = tx.subscribe();
                  let pool = pool_tcp.clone(); // Clone Arc
-                 let presence = presence_tcp.clone();
-                 let state = state_tcp.clone();
-                 let uid_map = uid_map_tcp.clone();
-                 let conn_id = ids_tcp.fetch_add(1, Ordering::Relaxed);
-                 tokio::spawn(async move {
-                    if let Err(e) = process_connection(socket, tx, rx, pool, presence, state, uid_map, conn_id).await {
+                let presence = presence_tcp.clone();
+                let repeat = repeat_tcp.clone();
+                let state = state_tcp.clone();
+                let uid_map = uid_map_tcp.clone();
+                let conn_id = ids_tcp.fetch_add(1, Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if let Err(e) = process_connection(socket, tx, rx, pool, presence, repeat, state, uid_map, conn_id).await {
                          error!("TCP Connection Error: {}", e);
                     }
                  });
@@ -275,6 +318,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              let rx = tx.subscribe();
              let pool = pool_tls.clone();
              let presence = presence_tls.clone();
+             let repeat = repeat_tls.clone();
              let state = state_tls.clone();
              let uid_map = uid_map_tls.clone();
              let conn_id = ids_tls.fetch_add(1, Ordering::Relaxed);
@@ -282,7 +326,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              tokio::spawn(async move {
                 match acceptor.accept(socket).await {
                     Ok(tls_stream) => {
-                        if let Err(e) = process_connection(tls_stream, tx, rx, pool, presence, state, uid_map, conn_id).await {
+                        if let Err(e) = process_connection(tls_stream, tx, rx, pool, presence, repeat, state, uid_map, conn_id).await {
                              error!("TLS Connection Error: {}", e);
                         }
                     }
@@ -342,15 +386,19 @@ async fn enterprise_sync_upload(
     Query(params): Query<HashMap<String, String>>,
     req: Request<Body>,
 ) -> impl IntoResponse {
+    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("10.8.0.1:8080").to_string();
     match extract_upload(&state, &params, req).await {
         Ok((data, mime_type)) => match save_enterprise_sync_bytes(&state.pool, &params, data, mime_type).await {
             Ok(meta) => {
-                maybe_broadcast_fileshare(&state, &params, &meta).await;
+                maybe_broadcast_fileshare(&state, &params, &meta, Some(host)).await;
                 (StatusCode::OK, Json(meta)).into_response()
             }
             Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response(),
         },
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response(),
+        Err(e) => {
+            warn!("EnterpriseSync upload error: {}", e);
+            (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response()
+        }
     }
 }
 
@@ -359,15 +407,19 @@ async fn enterprise_sync_upload_content(
     Query(params): Query<HashMap<String, String>>,
     req: Request<Body>,
 ) -> impl IntoResponse {
+    let host = req.headers().get("host").and_then(|v| v.to_str().ok()).unwrap_or("10.8.0.1:8080").to_string();
     match extract_upload(&state, &params, req).await {
         Ok((data, mime_type)) => match save_enterprise_sync_bytes(&state.pool, &params, data, mime_type).await {
             Ok(meta) => {
-                maybe_broadcast_fileshare(&state, &params, &meta).await;
+                maybe_broadcast_fileshare(&state, &params, &meta, Some(host)).await;
                 (StatusCode::OK, Json(json!({"objectid": meta["Hash"]}))).into_response()
             }
             Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response(),
         },
-        Err(e) => (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response(),
+        Err(e) => {
+            warn!("EnterpriseSync upload-content error: {}", e);
+            (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "message": e}))).into_response()
+        }
     }
 }
 
@@ -487,13 +539,17 @@ async fn enterprise_sync_mission_upload(
     req: Request<Body>,
 ) -> impl IntoResponse {
     let headers = req.headers().clone();
+    let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("10.8.0.1:8080").to_string();
     let result = match extract_upload(&state, &params, req).await {
         Ok((data, mime_type)) => save_enterprise_sync_bytes(&state.pool, &params, data, mime_type).await,
-        Err(e) => Err(e),
+        Err(e) => {
+            warn!("EnterpriseSync mission-upload error: {}", e);
+            Err(e)
+        }
     };
     match result {
         Ok(meta) => {
-            maybe_broadcast_fileshare(&state, &params, &meta).await;
+            maybe_broadcast_fileshare(&state, &params, &meta, Some(host)).await;
             let hash = meta.get("Hash").and_then(|v| v.as_str()).unwrap_or("");
             let host = headers.get("host").and_then(|v| v.to_str().ok()).unwrap_or("localhost:8080");
             let proto = headers.get("x-forwarded-proto").and_then(|v| v.to_str().ok()).unwrap_or("http");
@@ -718,9 +774,13 @@ async fn maybe_broadcast_fileshare(
     state: &Arc<AppState>,
     params: &HashMap<String, String>,
     meta: &Value,
+    server_host_override: Option<String>,
 ) {
-    let broadcast = params.get("broadcast").map(|v| v == "true" || v == "1").unwrap_or(false);
-    if !broadcast {
+    let broadcast = params.get("broadcast").map(|v| v == "true" || v == "1");
+    let creator = params.get("creatorUid").cloned().unwrap_or_default();
+    let auto_broadcast = creator.starts_with("ANDROID-");
+    let should_broadcast = broadcast.unwrap_or(auto_broadcast);
+    if !should_broadcast {
         return;
     }
     let hash = meta.get("Hash").and_then(|v| v.as_str()).unwrap_or("");
@@ -729,14 +789,25 @@ async fn maybe_broadcast_fileshare(
     }
     let name = meta.get("Name").and_then(|v| v.as_str()).unwrap_or("file");
     let size = meta.get("Size").and_then(|v| v.as_i64()).unwrap_or(0);
-    let sender_uid = params.get("senderUid").cloned().unwrap_or_else(|| "server-uid".to_string());
+    let sender_uid = params
+        .get("senderUid")
+        .or_else(|| params.get("creatorUid"))
+        .cloned()
+        .unwrap_or_else(|| "server-uid".to_string());
     let sender_callsign = params.get("senderCallsign").cloned().unwrap_or_else(|| "server".to_string());
     let dest_callsign = params.get("dest").or_else(|| params.get("callsign")).cloned();
 
-    let server_host = params.get("server").cloned().unwrap_or_else(|| "10.8.0.1:8080".to_string());
+    let server_host = server_host_override
+        .or_else(|| params.get("server").cloned())
+        .unwrap_or_else(|| "10.8.0.1:8080".to_string());
     let server_url = format!("http://{}/Marti/api/sync/metadata/{}/tool", server_host, hash);
     let cot = build_fileshare_cot(hash, name, size, &server_url, &sender_uid, &sender_callsign, dest_callsign.as_deref());
-    let _ = state.tx.send(BroadcastMsg { from: 0, bytes: cot });
+    info!("EnterpriseSync broadcast fileshare: hash={} name={} size={} url={}", hash, name, size, server_url);
+    let from_conn = {
+        let map = state.uid_to_conn.read().await;
+        map.get(&sender_uid).copied().unwrap_or(0)
+    };
+    let _ = state.tx.send(BroadcastMsg { from: from_conn, bytes: cot });
 }
 
 fn build_fileshare_cot(
@@ -753,16 +824,43 @@ fn build_fileshare_cot(
     let stale = (now + chrono::Duration::minutes(10)).to_rfc3339();
     let uid = Uuid::new_v4();
     let ack_uid = Uuid::new_v4();
+    let filename = if name.to_lowercase().ends_with(".zip") {
+        name.to_string()
+    } else {
+        format!("{name}.zip")
+    };
+    let filename = xml_escape(&filename);
+    let sender_url = xml_escape(sender_url);
+    let sender_uid = xml_escape(sender_uid);
+    let sender_callsign = xml_escape(sender_callsign);
+    let name = xml_escape(name);
+    let hash = xml_escape(hash);
     let mut detail = format!(
-        r#"<fileshare filename="{name}.zip" senderUrl="{sender_url}" sizeInBytes="{size}" sha256="{hash}" senderUid="{sender_uid}" senderCallsign="{sender_callsign}" name="{name}"/><ackrequest uid="{ack_uid}" ackrequested="true" tag="{name}"/>"#,
+        r#"<fileshare filename="{filename}" senderUrl="{sender_url}" sizeInBytes="{size}" sha256="{hash}" senderUid="{sender_uid}" senderCallsign="{sender_callsign}" name="{name}"/><ackrequest uid="{ack_uid}" ackrequested="true" tag="{name}"/>"#,
     );
     if let Some(dest) = dest_callsign {
+        let dest = xml_escape(dest);
         detail.push_str(&format!(r#"<marti><dest callsign="{dest}"/></marti>"#));
     }
     format!(
-        r#"<?xml version="1.0"?><event version="2.0" uid="{uid}" type="b-f-t-r" time="{time}" start="{time}" stale="{stale}" how="h-e"><point lat="0.0" lon="0.0" hae="0.0" ce="9999999" le="nan" /><detail>{detail}</detail></event>"#,
+        r#"<event version="2.0" uid="{uid}" type="b-f-t-r" time="{time}" start="{time}" stale="{stale}" how="h-e"><point lat="0.0" lon="0.0" hae="0.0" ce="9999999" le="9999999" /><detail>{detail}</detail></event>"#,
     )
     .into_bytes()
+}
+
+fn xml_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 async fn not_implemented() -> impl IntoResponse {
@@ -773,6 +871,7 @@ async fn not_implemented() -> impl IntoResponse {
 struct AppState {
     pool: Arc<SqlitePool>,
     tx: broadcast::Sender<BroadcastMsg>,
+    uid_to_conn: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -971,6 +1070,7 @@ async fn process_connection<S>(
     mut rx: broadcast::Receiver<BroadcastMsg>,
     pool: Arc<SqlitePool>,
     presence_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    repeat_cache: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     conn_state: Arc<RwLock<HashMap<u64, ConnState>>>,
     uid_to_conn: Arc<RwLock<HashMap<String, u64>>>,
     conn_id: u64,
@@ -983,19 +1083,31 @@ where S: AsyncRead + AsyncWrite + Unpin
     
     let (mut reader, mut writer) = tokio::io::split(socket);
     let mut buf = [0; 4096];
+    let mut pending: Vec<u8> = Vec::new();
+    let mut last_sent: Option<String> = None;
 
-    // Send cached presence to new connection
-    {
-        let cache = presence_cache.read().await;
-        for (_uid, bytes) in cache.iter() {
-            writer.write_all(bytes).await?;
-        }
-    }
+    let mut replay_sent = false;
 
     loop {
         tokio::select! {
             result = reader.read(&mut buf) => {
-                let n = result?;
+                let n = match result {
+                    Ok(n) => n,
+                    Err(e) => {
+                        let uid = {
+                            let state = conn_state.read().await;
+                            state.get(&conn_id).and_then(|s| s.uid.clone())
+                        };
+                        error!(
+                            "Read error conn_id={} uid={:?} last_sent={:?}: {}",
+                            conn_id,
+                            uid,
+                            last_sent,
+                            e
+                        );
+                        return Err(e.into());
+                    }
+                };
                 if n == 0 {
                     if let Some(uid) = cleanup_connection(conn_id, &conn_state, &uid_to_conn, &presence_cache).await {
                         let disconnect = build_disconnect_cot(&uid);
@@ -1004,38 +1116,75 @@ where S: AsyncRead + AsyncWrite + Unpin
                     return Ok(());
                 }
                 
-                let data = &buf[0..n];
-                
-                // Parse and validate CoT (for logging purposes)
-                if let Some((uid, cot_type, callsign, has_contact)) = parse_cot(data) {
-                     // Persist to DB
-                    let _ = sqlx::query(
-                        "INSERT INTO cot_history (uid, cot_type, raw_xml) VALUES (?, ?, ?)"
-                    )
-                    .bind(&uid)
-                    .bind(&cot_type)
-                    .bind(data)
-                    .execute(&*pool).await;
-
-                    if is_disconnect_type(&cot_type) {
-                        let _ = remove_presence(&uid, &presence_cache).await;
-                    } else if is_presence_type(&cot_type) {
-                        update_connection_state(conn_id, &uid, callsign.as_deref(), &conn_state, &uid_to_conn).await;
-                        let mut cache = presence_cache.write().await;
-                        cache.insert(uid.clone(), data.to_vec());
-                    } else if has_contact {
-                        update_connection_state(conn_id, &uid, callsign.as_deref(), &conn_state, &uid_to_conn).await;
+                pending.extend_from_slice(&buf[0..n]);
+                let events = extract_cot_events(&mut pending);
+                for event in events {
+                    let event = strip_xml_declaration(&event);
+                    if event.is_empty() {
+                        continue;
                     }
+                    // Parse and validate CoT (for logging purposes)
+                    if let Some((uid, cot_type, callsign, has_contact)) = parse_cot(&event) {
+                        if !replay_sent {
+                            replay_sent = true;
+                            if is_wintak_uid(&uid) {
+                                info!("Skipping cached replay for WinTAK uid={}", uid);
+                            } else {
+                                send_cached_events(
+                                    &mut writer,
+                                    &presence_cache,
+                                    &repeat_cache,
+                                    &mut last_sent
+                                ).await?;
+                            }
+                        }
+                        // Persist to DB
+                        let _ = sqlx::query(
+                            "INSERT INTO cot_history (uid, cot_type, raw_xml) VALUES (?, ?, ?)"
+                        )
+                        .bind(&uid)
+                        .bind(&cot_type)
+                        .bind(&event)
+                        .execute(&*pool).await;
 
-                    // Broadcast the raw bytes to all other subscribers
-                    let _ = tx.send(BroadcastMsg { from: conn_id, bytes: data.to_vec() });
+                        if cot_type == "t-x-c-t" {
+                            // Reply directly to keep the client connection alive.
+                            if is_wintak_uid(&uid) {
+                                info!("Skipping takPong for WinTAK uid={}", uid);
+                            } else {
+                                let pong = build_tak_pong();
+                                record_send(&mut writer, &pong, &mut last_sent).await?;
+                            }
+                            continue;
+                        } else if cot_type == "t-x-c-t-r" {
+                            // Ignore client pong traffic.
+                            continue;
+                        } else if is_disconnect_type(&cot_type) {
+                            let _ = remove_presence(&uid, &presence_cache).await;
+                        } else if is_presence_type(&cot_type) {
+                            update_connection_state(conn_id, &uid, callsign.as_deref(), &conn_state, &uid_to_conn).await;
+                            let mut cache = presence_cache.write().await;
+                            cache.insert(uid.clone(), event.clone());
+                        } else if should_repeat_type(&cot_type) {
+                            // Cache original event; refresh timestamps only when sending from cache.
+                            let mut cache = repeat_cache.write().await;
+                            cache.insert(uid.clone(), event.clone());
+                            let _ = tx.send(BroadcastMsg { from: conn_id, bytes: event.clone() });
+                            continue;
+                        } else if has_contact {
+                            update_connection_state(conn_id, &uid, callsign.as_deref(), &conn_state, &uid_to_conn).await;
+                        }
+
+                        // Broadcast the raw bytes to all other subscribers
+                        let _ = tx.send(BroadcastMsg { from: conn_id, bytes: event });
+                    }
                 }
             }
             result = rx.recv() => {
                 match result {
                     Ok(msg) => {
                         if msg.from != conn_id {
-                            writer.write_all(&msg.bytes).await?;
+                            record_send(&mut writer, &msg.bytes, &mut last_sent).await?;
                         }
                     }
                     Err(e) => {
@@ -1048,6 +1197,14 @@ where S: AsyncRead + AsyncWrite + Unpin
 }
 
 fn parse_cot(data: &[u8]) -> Option<(String, String, Option<String>, bool)> {
+    parse_cot_internal(data, true)
+}
+
+fn parse_cot_silent(data: &[u8]) -> Option<(String, String, Option<String>, bool)> {
+    parse_cot_internal(data, false)
+}
+
+fn parse_cot_internal(data: &[u8], log_event: bool) -> Option<(String, String, Option<String>, bool)> {
     let mut reader = Reader::from_reader(Cursor::new(data));
     reader.trim_text(true);
 
@@ -1112,7 +1269,9 @@ fn parse_cot(data: &[u8]) -> Option<(String, String, Option<String>, bool)> {
     }
 
     if is_event {
-        info!("Parsed CoT Event: UID={} TYPE={}", cot_uid, cot_type);
+        if log_event {
+            info!("Parsed CoT Event: UID={} TYPE={}", cot_uid, cot_type);
+        }
         return Some((cot_uid, cot_type, callsign, has_contact));
     }
     
@@ -1121,11 +1280,235 @@ fn parse_cot(data: &[u8]) -> Option<(String, String, Option<String>, bool)> {
 }
 
 fn is_presence_type(cot_type: &str) -> bool {
-    cot_type.starts_with("a-")
+    // Presence updates are the "user update" family, not generic a-* points.
+    // Keep this aligned with FTS user update handling.
+    cot_type.starts_with("a-f-G-")
+}
+
+fn is_drop_point_type(cot_type: &str) -> bool {
+    matches!(cot_type, "a-h-G" | "a-n-G" | "a-f-G" | "a-u-G")
 }
 
 fn is_disconnect_type(cot_type: &str) -> bool {
     cot_type == "t-x-d-d"
+}
+
+fn should_repeat_type(cot_type: &str) -> bool {
+    cot_type.starts_with("b-m-") || is_drop_point_type(cot_type)
+}
+
+fn is_wintak_uid(uid: &str) -> bool {
+    // WinTAK on Windows typically uses a SID-form UID.
+    uid.starts_with("S-1-5-21-")
+}
+
+fn describe_cot_for_log(data: &[u8]) -> String {
+    let trimmed = strip_xml_declaration(data);
+    if let Some((uid, cot_type, _callsign, _has_contact)) = parse_cot_silent(&trimmed) {
+        return format!("type={} uid={} bytes={}", cot_type, uid, trimmed.len());
+    }
+    let preview_len = 120.min(trimmed.len());
+    let preview = String::from_utf8_lossy(&trimmed[..preview_len]);
+    format!("bytes={} preview={}", trimmed.len(), preview)
+}
+
+fn rewrite_event_times(data: &[u8], stale_after: chrono::Duration) -> Option<Vec<u8>> {
+    let now = chrono::Utc::now();
+    let time = now.to_rfc3339();
+    let stale = (now + stale_after).to_rfc3339();
+
+    let mut reader = Reader::from_reader(Cursor::new(data));
+    reader.trim_text(false);
+    let mut writer = Writer::new(Vec::new());
+    let mut buf = Vec::new();
+
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"event" => {
+                let mut new = BytesStart::new("event");
+                for attr in e.attributes() {
+                    if let Ok(attr) = attr {
+                        let key = attr.key.as_ref();
+                        if key == b"time" || key == b"start" || key == b"stale" {
+                            continue;
+                        }
+                        new.push_attribute((key, attr.value.as_ref()));
+                    }
+                }
+                new.push_attribute(("time", time.as_str()));
+                new.push_attribute(("start", time.as_str()));
+                new.push_attribute(("stale", stale.as_str()));
+                writer.write_event(Event::Start(new)).ok()?;
+            }
+            Ok(Event::Empty(e)) if e.name().as_ref() == b"event" => {
+                let mut new = BytesStart::new("event");
+                for attr in e.attributes() {
+                    if let Ok(attr) = attr {
+                        let key = attr.key.as_ref();
+                        if key == b"time" || key == b"start" || key == b"stale" {
+                            continue;
+                        }
+                        new.push_attribute((key, attr.value.as_ref()));
+                    }
+                }
+                new.push_attribute(("time", time.as_str()));
+                new.push_attribute(("start", time.as_str()));
+                new.push_attribute(("stale", stale.as_str()));
+                writer.write_event(Event::Empty(new)).ok()?;
+            }
+            Ok(Event::Eof) => break,
+            Ok(ev) => {
+                writer.write_event(ev).ok()?;
+            }
+            Err(_) => return None,
+        }
+        buf.clear();
+    }
+
+    Some(writer.into_inner())
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn find_self_closing_event_end(buffer: &[u8]) -> Option<usize> {
+    if !buffer.starts_with(b"<event") {
+        return None;
+    }
+    if let Some(gt_idx) = buffer.iter().position(|b| *b == b'>') {
+        if gt_idx > 0 && buffer[gt_idx - 1] == b'/' {
+            return Some(gt_idx + 1);
+        }
+    }
+    None
+}
+
+fn trim_leading_whitespace(data: &mut Vec<u8>) {
+    while let Some(first) = data.first() {
+        match first {
+            b' ' | b'\n' | b'\r' | b'\t' => {
+                data.remove(0);
+            }
+            _ => break,
+        }
+    }
+}
+
+fn strip_xml_declaration(data: &[u8]) -> Vec<u8> {
+    let mut out = data.to_vec();
+    trim_leading_whitespace(&mut out);
+    if out.starts_with(b"<?xml") {
+        if let Some(end) = find_subsequence(&out, b"?>") {
+            let end = end + 2;
+            out.drain(0..end);
+            trim_leading_whitespace(&mut out);
+        }
+    }
+    out
+}
+
+async fn send_cached_events<W>(
+    writer: &mut W,
+    presence_cache: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    repeat_cache: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    last_sent: &mut Option<String>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    {
+        let cache = presence_cache.read().await;
+        for (_uid, bytes) in cache.iter() {
+            if let Some(updated) = rewrite_event_times(bytes, chrono::Duration::minutes(5)) {
+                record_send(writer, &updated, last_sent).await?;
+            } else {
+                record_send(writer, bytes, last_sent).await?;
+            }
+        }
+    }
+    {
+        let cache = repeat_cache.read().await;
+        for (_uid, bytes) in cache.iter() {
+            if let Some(updated) = rewrite_event_times(bytes, chrono::Duration::hours(24)) {
+                record_send(writer, &updated, last_sent).await?;
+            } else {
+                record_send(writer, bytes, last_sent).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn record_send<W>(
+    writer: &mut W,
+    data: &[u8],
+    last_sent: &mut Option<String>,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    *last_sent = Some(describe_cot_for_log(data));
+    write_event_line(writer, data).await
+}
+
+async fn write_event_line<W>(writer: &mut W, data: &[u8]) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    if data.is_empty() {
+        return Ok(());
+    }
+    writer.write_all(data).await?;
+    writer.write_all(b"\n").await?;
+    Ok(())
+}
+
+fn extract_cot_events(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut events = Vec::new();
+    const EVENT_START: &[u8] = b"<event";
+    const EVENT_END: &[u8] = b"</event>";
+
+    loop {
+        let start = match find_subsequence(buffer, EVENT_START) {
+            Some(idx) => idx,
+            None => {
+                // Keep a small tail in case the start tag is split across reads.
+                let keep = EVENT_START.len().saturating_sub(1);
+                if buffer.len() > keep {
+                    buffer.drain(0..buffer.len() - keep);
+                }
+                break;
+            }
+        };
+
+        if start > 0 {
+            buffer.drain(0..start);
+        }
+
+        if let Some(end_rel) = find_subsequence(buffer, EVENT_END) {
+            let end = end_rel + EVENT_END.len();
+            let event = buffer[..end].to_vec();
+            buffer.drain(0..end);
+            events.push(event);
+            continue;
+        }
+
+        if let Some(end) = find_self_closing_event_end(buffer) {
+            let event = buffer[..end].to_vec();
+            buffer.drain(0..end);
+            events.push(event);
+            continue;
+        }
+
+        // Need more data to complete the event.
+        break;
+    }
+
+    events
 }
 
 async fn update_connection_state(
@@ -1184,11 +1567,17 @@ fn build_disconnect_cot(uid: &str) -> Vec<u8> {
     let now = chrono::Utc::now();
     let time = now.to_rfc3339();
     let stale = (now + chrono::Duration::minutes(1)).to_rfc3339();
-    format!(r#"<?xml version="1.0" standalone="yes"?>
-<event version="2.0" uid="{}" type="t-x-d-d" time="{}" start="{}" stale="{}" how="h-g-i-g-o">
+    format!(r#"<event version="2.0" uid="{}" type="t-x-d-d" time="{}" start="{}" stale="{}" how="h-g-i-g-o">
     <point lat="0.0" lon="0.0" hae="0.0" ce="9999999" le="9999999"/>
     <detail><link uid="{}"/></detail>
 </event>"#, uid, time, time, stale, uid).into_bytes()
+}
+
+fn build_tak_pong() -> Vec<u8> {
+    // Match FTS-style takPong: no time/start/stale, default point values.
+    format!(r#"<event version="2.0" uid="takPong" type="t-x-c-t-r" how="h-g-i-g-o">
+    <point lat="0" lon="0" hae="9999999.0" ce="9999999.0" le="9999999.0"/>
+</event>"#).into_bytes()
 }
 
 #[cfg(test)]
@@ -1216,19 +1605,22 @@ mod tests {
     #[test]
     fn presence_rules_match_taxonomy() {
         assert!(is_presence_type("a-f-G-U-C"));
-        assert!(is_presence_type("a-h-G-U-C"));
+        assert!(is_presence_type("a-f-G-U-C-I"));
+        assert!(!is_presence_type("a-h-G"));
+        assert!(!is_presence_type("a-f-G"));
         assert!(!is_presence_type("b-t-f"));
         assert!(!is_presence_type("t-x-d-d"));
     }
 
     #[tokio::test]
-    async fn presence_cache_sent_to_new_connection() {
+    async fn presence_cache_sent_after_first_event() {
         let (tx, _rx) = broadcast::channel::<BroadcastMsg>(10);
         let presence_cache: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
+        let repeat_cache: Arc<RwLock<HashMap<String, Vec<u8>>>> = Arc::new(RwLock::new(HashMap::new()));
         let conn_state: Arc<RwLock<HashMap<u64, ConnState>>> = Arc::new(RwLock::new(HashMap::new()));
         let uid_to_conn: Arc<RwLock<HashMap<String, u64>>> = Arc::new(RwLock::new(HashMap::new()));
 
-        let cached = b"<event uid=\"Presence\" type=\"a-f\"/>";
+        let cached = b"<event uid=\"Presence\" type=\"a-f-G-U-C\"/>";
         {
             let mut cache = presence_cache.write().await;
             cache.insert("Presence".to_string(), cached.to_vec());
@@ -1238,8 +1630,22 @@ mod tests {
         let rx = tx.subscribe();
 
         let server_task = tokio::spawn(async move {
-            let _ = process_connection(server, tx, rx, Arc::new(SqlitePoolOptions::new().connect_lazy("sqlite::memory:").unwrap()), presence_cache, conn_state, uid_to_conn, 1).await;
+            let _ = process_connection(
+                server,
+                tx,
+                rx,
+                Arc::new(SqlitePoolOptions::new().connect_lazy("sqlite::memory:").unwrap()),
+                presence_cache,
+                repeat_cache,
+                conn_state,
+                uid_to_conn,
+                1
+            ).await;
         });
+
+        // Send a single presence event to trigger replay
+        let trigger = b"<event uid=\"Tester\" type=\"a-f-G-U-C\"/>";
+        client.write_all(trigger).await.unwrap();
 
         let mut buf = [0u8; 128];
         let n = client.read(&mut buf).await.unwrap();
