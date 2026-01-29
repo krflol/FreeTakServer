@@ -20,3 +20,5 @@ rustls-pemfile = "2.1"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4"] }
+ratatui = "0.26"
+crossterm = "0.27"
