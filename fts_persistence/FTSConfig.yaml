@@ -1,0 +1,9 @@
+Addresses:
+  FTS_DP_ADDRESS: 10.8.0.1
+  FTS_USER_ADDRESS: 10.8.0.1
+Filesystem:
+  FTS_DB_PATH: C:\dev\household\takserver\FreeTakServer\fts_persistence/FTSDataBase.db
+  FTS_MAINPATH: C:\dev\household\takserver\FreeTakServer\FreeTAKServer
+  FTS_LOGFILE_PATH: C:\dev\household\takserver\FreeTakServer\fts_persistence\Logs
+System:
+  FTS_NODE_ID: l8kqul73llo7pxmwkb8n5yewx1xz0zjc

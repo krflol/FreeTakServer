@@ -35,7 +35,9 @@ class TrackManagerFacade(DefaultFacade):
 #protectedend ######################################################################################
 
 
-	def __init__(self):
+	def __init__(self, *args, **kwargs):
+        # Call parent constructor
+		super().__init__(*args, **kwargs)
 #protectedstart classVars ##########################################################################
 #protectedend ######################################################################################
 
@@ -46,3 +48,5 @@ class TrackManagerFacade(DefaultFacade):
 #protectedend ######################################################################################
 
 
+
+TrackManager = TrackManagerFacade
