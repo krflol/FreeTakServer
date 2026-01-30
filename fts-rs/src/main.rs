@@ -777,9 +777,7 @@ async fn maybe_broadcast_fileshare(
     server_host_override: Option<String>,
 ) {
     let broadcast = params.get("broadcast").map(|v| v == "true" || v == "1");
-    let creator = params.get("creatorUid").cloned().unwrap_or_default();
-    let auto_broadcast = creator.starts_with("ANDROID-");
-    let should_broadcast = broadcast.unwrap_or(auto_broadcast);
+    let should_broadcast = broadcast.unwrap_or(true);
     if !should_broadcast {
         return;
     }
@@ -795,7 +793,12 @@ async fn maybe_broadcast_fileshare(
         .cloned()
         .unwrap_or_else(|| "server-uid".to_string());
     let sender_callsign = params.get("senderCallsign").cloned().unwrap_or_else(|| "server".to_string());
-    let dest_callsign = params.get("dest").or_else(|| params.get("callsign")).cloned();
+    let dest_callsign = params
+        .get("dest")
+        .or_else(|| params.get("callsign"))
+        .cloned()
+        .or_else(|| params.get("chatroom").cloned())
+        .or_else(|| params.get("uid").and_then(|u| extract_chatroom_from_uid(u)));
 
     let server_host = server_host_override
         .or_else(|| params.get("server").cloned())
@@ -846,6 +849,15 @@ fn build_fileshare_cot(
         r#"<event version="2.0" uid="{uid}" type="b-f-t-r" time="{time}" start="{time}" stale="{stale}" how="h-e"><point lat="0.0" lon="0.0" hae="0.0" ce="9999999" le="9999999" /><detail>{detail}</detail></event>"#,
     )
     .into_bytes()
+}
+
+fn extract_chatroom_from_uid(uid: &str) -> Option<String> {
+    // GeoChat.<sender uid>.<chatroom>.<uuid>
+    let parts: Vec<&str> = uid.split('.').collect();
+    if parts.len() >= 3 && parts[0].eq_ignore_ascii_case("geochat") {
+        return Some(parts[2].to_string());
+    }
+    None
 }
 
 fn xml_escape(input: &str) -> String {
